@@ -1,59 +1,44 @@
-```
+# GoRebind :  Dynamic Reverse Proxy and DNS Resolver
 
-### 2. Implementation details
+This project provides a combined service: a high-performance HTTP reverse proxy and an optional local DNS server. It is designed to dynamically route traffic based on the requested host and includes advanced configuration options for SSL, outbound proxying, and HTTP/2 handling.
 
-#### How the Config Works
-The program uses a strict JSON format. It defines a `routingTable` in memory.
-1.  It checks the `-config` flag.
-2.  If the flag is missing, it generates a random filename (e.g., `redirector-config-12345.json`) and sets that as the target path.
-3.  It checks if that file exists on disk.
-    * **If No:** It creates the file with a sample JSON array.
-    * **If Yes:** It reads the JSON.
-4.  It iterates over the JSON array, parsing the `source` (incoming Host header) and `target` (upstream URL) into a map for fast $O(1)$ lookups.
+## Features
 
-#### How Routing is Handled
-Inside the `proxyHandler` function:
-1.  **Host Extraction:** It grabs `r.Host` from the incoming request. It attempts to match it exactly against the loaded config. If that fails, it strips the port (e.g., `:8080`) and tries again.
-2.  **Request Construction:** A new HTTP request is created.
-    * **URL:** Combines the `Target` (scheme + host) with the *original* Path and Query strings.
-    * **Headers:** Loops through every single header in the original request and copies them to the new request.
-    * **Host Header:** Explicitly overwrites the `Host` header to match the `target` domain (required for virtual hosting/SNI).
-3.  **Transport:** The custom `http.Client` sends the request.
-4.  **Response:** The response headers and status code are copied back to the client, followed by streaming the body via `io.Copy`.
-
-#### Flags Explanation
-
-* `-config <file>`: Specifies the JSON file. If omitted, the program acts intelligently to generate a random one and use it.
-* `-skip-ssl-verify <true/false>`: Controls the `InsecureSkipVerify` setting in the TLS config. Defaults to `true` (skips verification) as requested.
-* `-port <num>`: Integers only. Sets the TCP port the Go server listens on.
-* `-proxy <url>`: If provided, the internal Transport sets its `Proxy` field to `http.ProxyURL`, routing outbound traffic through that gateway.
+- Dynamic Routing: Maps source hostnames (e.g., example.local) to target URLs (e.g., https://www.google.com) via a simple JSON configuration file.
+- Local DNS Resolver (Optional): When enabled, it responds to A record queries for configured hosts with a specified local IP address, eliminating the need to modify your local host files.
+- Proxy Stability Fixes: Includes specific httputil.ReverseProxy configurations to stabilize connections, specifically by handling Connection: close headers to prevent tls: user canceled errors.
+- Flexible TLS Handling: Allows skipping SSL certificate verification for local or development targets.
+- HTTP/2 Control: Flag to force-enable or prevent HTTP/2 negotiation based on your backend or network requirements.
 
 #### How to Build & Run
 
-**1. Initialize Module (Optional but recommended):**
-```bash
-go mod init redirector
-```
-
 **2. Build:**
+
 ```bash
-go build -o redirector main.go
+go build -o redirector .
 ```
 
 **3. Run (Basic):**
 ```bash
 ./redirector
-# Output: No config specified. Using generated filename: redirector-config-85721.json ...
+# Output: No config specified. Using generated filename: redirector-config.json ...
+
 ```
+
+**4. Run (With DNS):**
+```bash
+./redirector -config config.json -port 8080 -dns -I wlan0
+```
+
 
 **4. Run (Custom):**
 ```bash
-./redirector -config myroutes.json -port 8080 -skip-ssl-verify=false
+./redirector -config config.json -port 8080 
 ```
 
 ### 3. Example Config File
 
-Create a file named `routes.json`:
+Create a file named `config.json`:
 
 ```json
 [
@@ -69,4 +54,40 @@ Create a file named `routes.json`:
     "source": "secure.internal",
     "target": "https://192.168.1.50"
   }
-]# GoRebind
+]
+```
+
+### Command Line Flags
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `-port` | `int` | `80` | Port for the HTTP reverse proxy to listen on. |
+| `-config` | `string` | (auto-detect) | Path to the JSON configuration file. |
+| `-skip-ssl-verify` | `bool` | `true` | Skips TLS certificate verification for upstream targets. Useful for self-signed certificates. |
+| `-proxy` | `string` | `""` | Outbound HTTP proxy URL (e.g., `http://user:pass@10.0.0.1:8080`). |
+| `-http2` | `bool` | `false` | **Force-enable HTTP/2.** Set to `true` if your targets support H2 and you require it. *(Note: Setting this to `false` applies stability fixes to prevent the 'tls: user canceled' error.)* |
+| **DNS Flags** | | | |
+| `-dns` | `bool` | `false` | Enable the local DNS server on port 53 (UDP). |
+| `-interface`, `-I` | `string` | `""` | Network interface name (e.g., `eth0` or `en0`). The IPv4 address of this interface will be returned for all matched hostnames. **Required if `-dns` is enabled.** |
+| `-verbose` | `bool` | `false` | Enable verbose logging. Only shows DNS queries that result in a system lookup (misses). |
+
+
+### FAQ
+
+#### Troubleshooting: `httputil: ReverseProxy read error... tls: user canceled`
+
+This error often occurs when an intermediate proxy (like Burp Suite or Zap) is used, and the underlying connection is closed prematurely by the backend.
+
+**Workaround for Burp Suite:**
+
+1. Navigate to **Settings** > **Proxy** > **HTTP**.
+
+2. Go to the **Match and Replace** rules section.
+
+3. Add a new rule:
+
+   * **Type:** `Response header`
+
+   * **Match:** `Connection: close`
+
+   * **Replace:** `Connection: keep-alive`
