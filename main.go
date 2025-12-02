@@ -31,7 +31,7 @@ var (
 
 	// Interface IP for DNS responses
 	interfaceIP net.IP
-	
+
 	// Global verbose flag
 	verboseMode bool
 )
@@ -46,6 +46,7 @@ func main() {
 	ifaceName := flag.String("interface", "", "Network interface name (required for DNS)")
 	ifaceNameShort := flag.String("I", "", "Alias for -interface")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging for DNS misses")
+	forceH2 := flag.Bool("http2", false, "Force enable HTTP/2 (may cause 'tls: user canceled' errors on some proxies)")
 	flag.Parse()
 
 	// Set global verbose state
@@ -60,7 +61,6 @@ func main() {
 	// 2. Config Loading / Generation
 	targetConfig := *configPath
 	if targetConfig == "" {
-		// specific logic: if no flag, look for local, else generate random
 		if _, err := os.Stat("config.json"); err == nil {
 			targetConfig = "config.json"
 			log.Println("No config flag provided, using existing 'config.json'")
@@ -90,7 +90,7 @@ func main() {
 	}
 
 	// 4. HTTP Redirector Setup
-	startHTTPServer(*port, *skipSSL, *proxyURL)
+	startHTTPServer(*port, *skipSSL, *proxyURL, *forceH2)
 }
 
 // --- Configuration Logic ---
@@ -123,7 +123,6 @@ func loadConfig(path string) {
 			log.Printf("Warning: Skipping invalid target URL %s: %v", r.Target, err)
 			continue
 		}
-		// Normalize source (lowercase)
 		routeMap[strings.ToLower(r.Source)] = targetURL
 		log.Printf("Loaded Route: %s -> %s", r.Source, r.Target)
 	}
@@ -131,7 +130,6 @@ func loadConfig(path string) {
 
 // --- HTTP Redirector Logic ---
 
-// loggingResponseWriter captures the status code for logging purposes
 type loggingResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
@@ -142,21 +140,34 @@ func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.ResponseWriter.WriteHeader(code)
 }
 
-func startHTTPServer(port int, skipSSL bool, proxyAddr string) {
-	// Configure Transport (Proxy + TLS settings)
+func startHTTPServer(port int, skipSSL bool, proxyAddr string, enableH2 bool) {
+	
+	// Determine TLS ALPN protocols
+	var nextProtos []string
+	if !enableH2 {
+		// FORCE HTTP/1.1 if H2 is disabled (prevents upgrade attempts)
+		nextProtos = []string{"http/1.1"}
+	}
+	// If enableH2 is true, we leave nextProtos as nil, 
+	// which allows Go to negotiate ["h2", "http/1.1"] automatically.
+
+	// Determine TLSNextProto map
+	var tlsNextProto map[string]func(authority string, c *tls.Conn) http.RoundTripper
+	if !enableH2 {
+		// EMPTY MAP disables H2 support in the transport
+		tlsNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+	}
+	// If enableH2 is true, we leave it nil, which uses Go's default (supporting H2)
+
+	// Configure Transport
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: skipSSL,
-			// Helps, but not always enough alone:
-			NextProtos: []string{"http/1.1"}, 
+			NextProtos:         nextProtos,
 		},
-		// STRICTLY DISABLE HTTP/2
-		// Setting this to an empty map prevents the transport from configuring 
-		// its internal HTTP/2 transport, which solves the "tls: user canceled" error.
-		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
-		
-		ForceAttemptHTTP2: false, 
-		Proxy:             http.ProxyFromEnvironment, // Default fallback
+		TLSNextProto:      tlsNextProto, // The switch for ALPN support
+		ForceAttemptHTTP2: enableH2,     // The switch for H2C/Upgrades
+		Proxy:             http.ProxyFromEnvironment,
 	}
 
 	if proxyAddr != "" {
@@ -168,7 +179,6 @@ func startHTTPServer(port int, skipSSL bool, proxyAddr string) {
 		log.Printf("Using outbound proxy: %s", proxyAddr)
 	}
 
-	// Create the Reverse Proxy
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
 		Director: func(req *http.Request) {
@@ -180,19 +190,12 @@ func startHTTPServer(port int, skipSSL bool, proxyAddr string) {
 				return
 			}
 
-			// 1. Rewrite URL Scheme and Host to target
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
-
-			// 2. Rewrite Host header to target Host
 			req.Host = target.Host
-
-			// 3. Remove X-Forwarded-For to prevent header growth
 			req.Header["X-Forwarded-For"] = nil
 		},
-		// Custom error handler
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			// Only log errors if they aren't standard context cancellations
 			if err != nil && err.Error() != "context canceled" {
 				log.Printf("[ERROR] Proxy Error for %s: %v", r.Host, err)
 			}
@@ -200,22 +203,15 @@ func startHTTPServer(port int, skipSSL bool, proxyAddr string) {
 		},
 	}
 
-	// Logging Wrapper
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// start := time.Now()
-		// Optional: You might want to hide [HTTP-IN] logs too if not verbose, 
-		// but I kept them as per request to only hide DNS.
 		log.Printf("[HTTP-IN] %s %s %s", r.Method, r.Host, r.URL.Path)
-
 		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		proxy.ServeHTTP(lrw, r)
-		
-		// Log completed request
-		// log.Printf("[HTTP-OUT] ...") 
 	})
 
 	log.Printf("HTTP Redirector listening on port %d...", port)
-	
+	log.Printf("HTTP/2 Enabled: %v", enableH2)
+
 	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), handler); err != nil {
 		log.Fatal(err)
 	}
@@ -266,15 +262,12 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 		mu.RUnlock()
 
 		if exists && q.Qtype == dns.TypeA {
-			// Always log matches
 			log.Printf("[DNS] Match: %s -> Returning Interface IP", name)
 			rr, err := dns.NewRR(fmt.Sprintf("%s A %s", q.Name, interfaceIP.String()))
 			if err == nil {
 				m.Answer = append(m.Answer, rr)
 			}
 		} else {
-			// Forward to System Resolver
-			// ONLY log if verbose mode is on
 			if verboseMode {
 				log.Printf("[DNS] No Match/Not A-Record: %s -> System Lookup", name)
 			}
