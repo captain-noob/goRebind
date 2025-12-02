@@ -65,7 +65,7 @@ func main() {
 			targetConfig = "config.json"
 			log.Println("No config flag provided, using existing 'config.json'")
 		} else {
-			targetConfig = fmt.Sprintf("config-example.json", time.Now().UnixNano()) // Fixed Sprintf formatting
+			targetConfig = fmt.Sprintf("config-example.json") // Fixed Sprintf formatting
 			createDummyConfig(targetConfig)
 			log.Printf("Created random config file: %s\n", targetConfig)
 		}
