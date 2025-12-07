@@ -1,39 +1,48 @@
-# goRebind :  Dynamic Reverse Proxy and DNS Resolver
+# goRebind : Dynamic Reverse Proxy and DNS Resolver
 
 This project provides a combined service: a high-performance HTTP reverse proxy and an optional local DNS server. It is designed to dynamically route traffic based on the requested host and includes advanced configuration options for SSL, outbound proxying, and HTTP/2 handling.
 
 ## Features
 
-- Dynamic Routing: Maps source hostnames (e.g., example.local) to target URLs (e.g., https://www.google.com) via a simple JSON configuration file.
-- Local DNS Resolver (Optional): When enabled, it responds to A record queries for configured hosts with a specified local IP address, eliminating the need to modify your local host files.
-- Proxy Stability Fixes: Includes specific httputil.ReverseProxy configurations to stabilize connections, specifically by handling Connection: close headers to prevent tls: user canceled errors.
-- Flexible TLS Handling: Allows skipping SSL certificate verification for local or development targets.
-- HTTP/2 Control: Flag to force-enable or prevent HTTP/2 negotiation based on your backend or network requirements.
+- **Dynamic Routing**: Maps source hostnames (e.g., `example.local`) to target URLs (e.g., `https://www.google.com`) via a simple JSON configuration file.
+- **Local DNS Resolver (Optional)**: When enabled, it responds to `A` record queries for configured hosts with a specified local IP address, eliminating the need to modify your local host files.
+- **Enhanced Proxy Stability**: Includes two crucial flags (`-http2=false` and `-no-keep-alive`) to resolve common proxy errors like `tls: user canceled` and `Unsolicited response`.
+- **Flexible TLS Handling**: Allows skipping SSL certificate verification for local or development targets.
+- **HTTP/2 Control**: Flag to force-enable or prevent HTTP/2 negotiation based on your backend or network requirements.
 
-#### How to Build & Run
+***
 
-**2. Build:**
+### 1. Prerequisites
+
+You need Go installed (`go version 1.18+` recommended).
+
+### 2. How to Build & Run
+
+**A. Clone and Build:**
 
 ```bash
-go build -o redirector .
+# Clone or ensure you are in the project directory
+go build -o goRebind .
 ```
+
 
 **3. Run (Basic):**
 ```bash
-./redirector
-# Output: No config specified. Using generated filename: redirector-config.json ...
+./goRebind
+# Output: HTTP Redirector listening on port 80...
 
 ```
 
 **4. Run (With DNS):**
 ```bash
-./redirector -config config.json -port 8080 -dns -I wlan0
+# Example for Linux/macOS
+./goRebind -config config.json -port 8080 -dns -I wlan0
 ```
 
 
 **4. Run (Custom):**
 ```bash
-./redirector -config config.json -port 8080 
+./goRebind -config config.json -port 8080 
 ```
 
 ### 3. Example Config File
@@ -70,6 +79,7 @@ Create a file named `config.json`:
 | `-dns` | `bool` | `false` | Enable the local DNS server on port 53 (UDP). |
 | `-interface`, `-I` | `string` | `""` | Network interface name (e.g., `eth0` or `en0`). The IPv4 address of this interface will be returned for all matched hostnames. **Required if `-dns` is enabled.** |
 | `-verbose` | `bool` | `false` | Enable verbose logging. Only shows DNS queries that result in a system lookup (misses). |
+| `-no-keep-alive` | `bool` | `false` | Disable HTTP connection reuse (keep-alives). Use this flag if you encounter "Unsolicited response" or "readLoopPeekFailLocked" proxy errors. |
 
 
 ### FAQ
