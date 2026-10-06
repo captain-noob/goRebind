@@ -133,6 +133,16 @@ On Windows, name the output `goRebind.exe`. To build all six release targets (li
 
 The binaries go to `build/goRebind-<os>-<arch>[.exe]`, which git ignores.
 
+## Releasing
+
+Releases are cut by `.github/workflows/release.yml`. Push a `v*` tag (or run the workflow manually from the Actions tab and type the tag):
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+The workflow vets and tests, cross-compiles all six targets with `CGO_ENABLED=0 -trimpath -ldflags "-s -w -X main.version=<tag>"`, packages each as a `.tar.gz` (`.zip` for Windows) containing the binary and `Readme.md`, writes `SHA256SUMS.txt`, and publishes a GitHub Release with auto-generated notes. The injected version is what `goRebind -version` prints (`dev` for local builds).
+
 ## Running locally
 
 ### Config
@@ -281,4 +291,4 @@ Remove each one when it's fixed.
 3. **A repeatable `-route src=target` flag** for quick runs without a config file.
 4. **Auto-detect the outbound IP** when `-I` is omitted.
 5. **A `-dump` flag** that prints full requests and responses.
-6. **A release workflow** (goreleaser or GitHub Actions) building with `CGO_ENABLED=0 -ldflags "-s -w"`.
+6. **A Docker image and a systemd unit** for easy deployment onto a test box. (The release workflow in [Releasing](#releasing) already ships cross-platform binaries.)

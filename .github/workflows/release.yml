@@ -1,0 +1,80 @@
+name: release
+
+# Cut a release by pushing a tag:  git tag v1.0.0 && git push origin v1.0.0
+# Or run it manually from the Actions tab and type the tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to release (e.g. v1.2.3)
+        required: true
+
+permissions:
+  contents: write # required to create the release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release archives
+        env:
+          CGO_ENABLED: '0'
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          platforms=(linux/amd64 linux/arm64 windows/amd64 windows/arm64 darwin/amd64 darwin/arm64)
+          for p in "${platforms[@]}"; do
+            os="${p%%/*}"; arch="${p##*/}"
+            bin="goRebind"
+            if [ "$os" = windows ]; then bin="goRebind.exe"; fi
+            stage="goRebind_${VERSION}_${os}_${arch}"
+            mkdir -p "dist/$stage"
+            echo "==> building $os/$arch"
+            GOOS="$os" GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/$stage/$bin" .
+            cp Readme.md "dist/$stage/"
+            if [ "$os" = windows ]; then
+              (cd dist && zip -qr "${stage}.zip" "$stage")
+            else
+              (cd dist && tar -czf "${stage}.tar.gz" "$stage")
+            fi
+            rm -rf "dist/${stage:?}"
+          done
+          (cd dist && sha256sum goRebind_* > SHA256SUMS.txt)
+          ls -lh dist
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          gh release create "$VERSION" dist/goRebind_* dist/SHA256SUMS.txt \
+            --title "$VERSION" \
+            --generate-notes

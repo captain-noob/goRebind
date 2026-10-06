@@ -18,6 +18,10 @@ import (
 )
 
 var (
+	// version is "dev" for local builds and overridden at release time via
+	// -ldflags "-X main.version=<tag>".
+	version = "dev"
+
 	// Global verbose flag, read by the DNS handler
 	verboseMode bool
 
@@ -41,7 +45,13 @@ func main() {
 	verbose := flag.Bool("verbose", false, "Enable verbose logging for DNS misses")
 	forceH2 := flag.Bool("http2", false, "Force enable HTTP/2 (may cause 'tls: user canceled' errors on some proxies)")
 	disableKeepAlive := flag.Bool("no-keep-alive", false, "Disable HTTP connection reuse (fixes 'unsolicited response' in some proxies)")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("goRebind", version)
+		return
+	}
 
 	// Set global verbose state
 	verboseMode = *verbose

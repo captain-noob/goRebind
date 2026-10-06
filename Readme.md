@@ -93,7 +93,17 @@ Create a file named `config.json`:
 | `-interface`, `-I` | `string` | `""` | Network interface name (e.g., `eth0` or `en0`). The IPv4 address of this interface will be returned for all matched hostnames. **Required if `-dns` is enabled.** |
 | `-verbose` | `bool` | `false` | Enable verbose logging of DNS queries that aren't answered with the interface IP (passed upstream, or non-`A` queries for configured hosts). |
 | `-no-keep-alive` | `bool` | `false` | Disable HTTP connection reuse (keep-alives). Use this flag if you encounter "Unsolicited response" or "readLoopPeekFailLocked" proxy errors. |
+| `-version` | `bool` | `false` | Print the version and exit. |
 
+### Releases
+
+Prebuilt binaries for Linux, Windows and macOS (amd64 and arm64) are attached to each [GitHub Release](../../releases). Download the archive for your platform, unpack it, and run the binary. Verify your download against `SHA256SUMS.txt`:
+
+```bash
+sha256sum -c SHA256SUMS.txt --ignore-missing
+```
+
+Releases are built automatically by the `release` GitHub Actions workflow when a `v*` tag is pushed.
 
 ### FAQ
 
