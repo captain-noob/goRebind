@@ -1,38 +1,28 @@
 package main
 
 import (
-	"crypto/tls"
-	"encoding/json"
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
-	"strings"
-	"sync"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/miekg/dns"
 )
 
-// ConfigRoute represents a single mapping rule
-type ConfigRoute struct {
-	Source string `json:"source"`
-	Target string `json:"target"`
-}
-
 var (
-	// Global map for O(1) lookups during high traffic
-	routeMap = make(map[string]*url.URL)
-	mu       sync.RWMutex
-
-	// Interface IP for DNS responses
-	interfaceIP net.IP
-
-	// Global verbose flag
+	// Global verbose flag, read by the DNS handler
 	verboseMode bool
+
+	// Set once shutdown begins, so serve loops don't treat the closed listener as a fatal error
+	shuttingDown atomic.Bool
 )
 
 func main() {
@@ -42,8 +32,12 @@ func main() {
 	port := flag.Int("port", 80, "Port for HTTP server")
 	proxyURL := flag.String("proxy", "", "Optional outbound HTTP proxy URL")
 	enableDNS := flag.Bool("dns", false, "Enable DNS server functionality")
+	dnsAddr := flag.String("dns-addr", ":53", "Listen address for the DNS server (UDP and TCP)")
+	upstream := flag.String("upstream", "", "Upstream DNS server for names not in the config, e.g. 1.1.1.1 (default: system resolver)")
 	ifaceName := flag.String("interface", "", "Network interface name (required for DNS)")
 	ifaceNameShort := flag.String("I", "", "Alias for -interface")
+	enableHTTPS := flag.Bool("https", false, "Enable HTTPS SNI passthrough (routes TLS by SNI without decrypting it)")
+	httpsAddr := flag.String("https-addr", ":443", "Listen address for the HTTPS SNI passthrough listener")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging for DNS misses")
 	forceH2 := flag.Bool("http2", false, "Force enable HTTP/2 (may cause 'tls: user canceled' errors on some proxies)")
 	disableKeepAlive := flag.Bool("no-keep-alive", false, "Disable HTTP connection reuse (fixes 'unsolicited response' in some proxies)")
@@ -67,241 +61,65 @@ func main() {
 		} else {
 			targetConfig = "config-example.json"
 			createDummyConfig(targetConfig)
-			log.Printf("Created random config file: %s\n", targetConfig)
+			log.Printf("Created example config file: %s\n", targetConfig)
 		}
 	}
 
 	loadConfig(targetConfig)
+	go watchConfig(targetConfig)
+
+	// Shut down cleanly on Ctrl-C / SIGTERM
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// 3. DNS Server Setup (Optional)
+	var dnsServers []*dns.Server
 	if *enableDNS {
 		if finalIface == "" {
 			log.Fatal("Error: -interface or -I is required when -dns is enabled")
 		}
-
-		var err error
-		interfaceIP, err = getInterfaceIP(finalIface)
-		if err != nil {
-			log.Fatalf("Error getting IP for interface %s: %v", finalIface, err)
+		if err := setupDNS(finalIface, *upstream); err != nil {
+			log.Fatalf("Error: %v", err)
 		}
-		log.Printf("DNS Server enabled. Responding with IP %s for matched hosts.", interfaceIP.String())
-
-		go startDNSServer()
+		dnsServers = startDNSServer(*dnsAddr)
 	}
 
-	// 4. HTTP Redirector Setup
-	startHTTPServer(*port, *skipSSL, *proxyURL, *forceH2, *disableKeepAlive)
-}
-
-// --- Configuration Logic ---
-
-func createDummyConfig(filename string) {
-	dummy := []ConfigRoute{
-		{Source: "example.local", Target: "https://www.google.com"},
-		{Source: "api.local", Target: "http://127.0.0.1:8080"},
-	}
-	file, _ := json.MarshalIndent(dummy, "", "  ")
-	_ = os.WriteFile(filename, file, 0644)
-}
-
-func loadConfig(path string) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		log.Fatalf("Failed to read config: %v", err)
+	// 4. HTTPS SNI passthrough (Optional)
+	var sniListener net.Listener
+	if *enableHTTPS {
+		sniListener = startSNIServer(*httpsAddr)
 	}
 
-	var routes []ConfigRoute
-	if err := json.Unmarshal(data, &routes); err != nil {
-		log.Fatalf("Invalid JSON config: %v", err)
+	// 5. HTTP Redirector
+	httpServer := &http.Server{
+		Addr:    fmt.Sprintf(":%d", *port),
+		Handler: newProxyHandler(*skipSSL, *proxyURL, *forceH2, *disableKeepAlive),
 	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	for _, r := range routes {
-		targetURL, err := url.Parse(r.Target)
-		if err != nil {
-			log.Printf("Warning: Skipping invalid target URL %s: %v", r.Target, err)
-			continue
+	go func() {
+		log.Printf("HTTP Redirector listening on port %d...", *port)
+		log.Printf("HTTP/2 Enabled: %v", *forceH2)
+		log.Printf("Keep-Alives Enabled: %v", !*disableKeepAlive)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("HTTP server error: %v", err)
 		}
-		routeMap[strings.ToLower(r.Source)] = targetURL
-		log.Printf("Loaded Route: %s -> %s", r.Source, r.Target)
+	}()
+
+	// 6. Wait for a signal, then stop everything
+	<-ctx.Done()
+	stop() // restore default handling so a second Ctrl-C force-quits
+	shuttingDown.Store(true)
+	log.Println("Shutting down...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP shutdown: %v", err)
 	}
-}
-
-// --- HTTP Redirector Logic ---
-
-type loggingResponseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (lrw *loggingResponseWriter) WriteHeader(code int) {
-	lrw.statusCode = code
-	lrw.ResponseWriter.WriteHeader(code)
-}
-
-func startHTTPServer(port int, skipSSL bool, proxyAddr string, enableH2 bool, disableKeepAlive bool) {
-
-	// --- H2 Negotiation Fix ---
-
-	// Determine TLS ALPN protocols
-	var nextProtos []string
-	// Determine TLSNextProto map
-	var tlsNextProto map[string]func(authority string, c *tls.Conn) http.RoundTripper
-
-	if !enableH2 {
-		// Aggressively force HTTP/1.1 to bypass proxy/firewall H2 inspection issues
-		nextProtos = []string{"http/1.1"}
-		// Explicitly setting an EMPTY MAP disables HTTP/2 support in the transport
-		tlsNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+	for _, s := range dnsServers {
+		_ = s.Shutdown()
 	}
-	// If enableH2 is true, nextProtos and tlsNextProto remain nil, using Go's default H2 support.
-
-	// Configure Transport
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: skipSSL,
-			NextProtos:         nextProtos, // Forces http/1.1 if H2 is disabled
-		},
-		TLSNextProto:      tlsNextProto, // Explicitly disables H2 if enableH2 is false
-		ForceAttemptHTTP2: enableH2,
-		Proxy:             http.ProxyFromEnvironment,
-		DisableKeepAlives: disableKeepAlive, // New option to fix 'unsolicited response'
+	if sniListener != nil {
+		_ = sniListener.Close()
 	}
-
-	if proxyAddr != "" {
-		pURL, err := url.Parse(proxyAddr)
-		if err != nil {
-			log.Fatalf("Invalid proxy URL: %v", err)
-		}
-		transport.Proxy = http.ProxyURL(pURL)
-		log.Printf("Using outbound proxy: %s", proxyAddr)
-	}
-
-	proxy := &httputil.ReverseProxy{
-		Transport: transport,
-		Director: func(req *http.Request) {
-			mu.RLock()
-			target, exists := routeMap[strings.ToLower(req.Host)]
-			mu.RUnlock()
-
-			if !exists {
-				return
-			}
-
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.Host = target.Host
-			req.Header["X-Forwarded-For"] = nil
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if err != nil && err.Error() != "context canceled" {
-				log.Printf("[ERROR] Proxy Error for %s: %v", r.Host, err)
-			}
-			w.WriteHeader(http.StatusBadGateway)
-		},
-	}
-
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[HTTP-IN] %s %s %s", r.Method, r.Host, r.URL.Path)
-		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		proxy.ServeHTTP(lrw, r)
-	})
-
-	log.Printf("HTTP Redirector listening on port %d...", port)
-	log.Printf("HTTP/2 Enabled: %v", enableH2)
-	log.Printf("Keep-Alives Enabled: %v", !disableKeepAlive)
-
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), handler); err != nil {
-		log.Fatal(err)
-	}
-}
-
-// --- DNS Server Logic ---
-
-func getInterfaceIP(name string) (net.IP, error) {
-	iface, err := net.InterfaceByName(name)
-	if err != nil {
-		return nil, err
-	}
-	addrs, err := iface.Addrs()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				return ipnet.IP.To4(), nil
-			}
-		}
-	}
-	return nil, fmt.Errorf("no IPv4 address found on interface %s", name)
-}
-
-func startDNSServer() {
-	dns.HandleFunc(".", handleDNSRequest)
-	server := &dns.Server{Addr: ":53", Net: "udp"}
-	log.Println("DNS Server listening on UDP :53...")
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("Failed to start DNS server: %v", err)
-	}
-}
-
-func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
-	m := new(dns.Msg)
-	m.SetReply(r)
-	m.Compress = false
-
-	if r.Opcode == dns.OpcodeQuery && len(r.Question) > 0 {
-		q := r.Question[0]
-		name := strings.TrimSuffix(strings.ToLower(q.Name), ".")
-
-		mu.RLock()
-		_, exists := routeMap[name]
-		mu.RUnlock()
-
-		if exists && q.Qtype == dns.TypeA {
-			log.Printf("[DNS] Match: %s -> Returning Interface IP", name)
-			rr, err := dns.NewRR(fmt.Sprintf("%s A %s", q.Name, interfaceIP.String()))
-			if err == nil {
-				m.Answer = append(m.Answer, rr)
-			}
-		} else {
-			if verboseMode {
-				log.Printf("[DNS] No Match/Not A-Record: %s -> System Lookup", name)
-			}
-			resp := systemDNSLookup(q)
-			if resp != nil {
-				m.Answer = resp
-			}
-		}
-	}
-
-	w.WriteMsg(m)
-}
-
-func systemDNSLookup(q dns.Question) []dns.RR {
-	name := strings.TrimSuffix(q.Name, ".")
-
-	// Use net.LookupHost to get both A and AAAA records simultaneously
-	// We do not use net.LookupIP here as it is deprecated for looking up specific types.
-	// For simplicity in this proxy, we'll stick to net.LookupIP as in the original code,
-	// but check for the IP version before creating the RR.
-	ips, err := net.LookupIP(name)
-	if err != nil {
-		return nil
-	}
-
-	var answers []dns.RR
-	for _, ip := range ips {
-		if q.Qtype == dns.TypeA && ip.To4() != nil {
-			rr, _ := dns.NewRR(fmt.Sprintf("%s A %s", q.Name, ip.String()))
-			answers = append(answers, rr)
-		} else if q.Qtype == dns.TypeAAAA && ip.To4() == nil {
-			rr, _ := dns.NewRR(fmt.Sprintf("%s AAAA %s", q.Name, ip.String()))
-			answers = append(answers, rr)
-		}
-	}
-	return answers
+	log.Println("Stopped.")
 }
