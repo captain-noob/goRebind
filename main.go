@@ -92,14 +92,20 @@ func main() {
 
 	// 5. HTTP Redirector
 	httpServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", *port),
-		Handler: newProxyHandler(*skipSSL, *proxyURL, *forceH2, *disableKeepAlive),
+		Handler:           newProxyHandler(*skipSSL, *proxyURL, *forceH2, *disableKeepAlive),
+		ReadHeaderTimeout: 10 * time.Second,  // bound slow-loris header sends
+		IdleTimeout:       120 * time.Second, // (no Write/Read body timeout: the proxy streams)
 	}
+	httpAddr := fmt.Sprintf(":%d", *port)
+	httpLn, err := net.Listen("tcp", httpAddr)
+	if err != nil {
+		log.Fatalf("Failed to listen on %s: %v", httpAddr, err)
+	}
+	log.Printf("HTTP Redirector listening on port %d...", *port)
+	log.Printf("HTTP/2 Enabled: %v", *forceH2)
+	log.Printf("Keep-Alives Enabled: %v", !*disableKeepAlive)
 	go func() {
-		log.Printf("HTTP Redirector listening on port %d...", *port)
-		log.Printf("HTTP/2 Enabled: %v", *forceH2)
-		log.Printf("Keep-Alives Enabled: %v", !*disableKeepAlive)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := httpServer.Serve(httpLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("HTTP server error: %v", err)
 		}
 	}()

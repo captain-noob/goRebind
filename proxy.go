@@ -65,6 +65,15 @@ func newProxyHandler(skipSSL bool, proxyAddr string, enableH2 bool, disableKeepA
 		ForceAttemptHTTP2: enableH2,
 		Proxy:             http.ProxyFromEnvironment,
 		DisableKeepAlives: disableKeepAlive, // New option to fix 'unsolicited response'
+		// Timeouts so a hung or slow target can't pin a connection forever. These bound only
+		// connection setup and idle reuse, not the response body, so streaming still works.
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 
 	if proxyAddr != "" {
@@ -79,7 +88,11 @@ func newProxyHandler(skipSSL bool, proxyAddr string, enableH2 bool, disableKeepA
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			route := pr.In.Context().Value(routeKey{}).(proxyRoute)
+			route, ok := pr.In.Context().Value(routeKey{}).(proxyRoute)
+			if !ok {
+				// Always set by the handler below; guard anyway so a future caller can't panic here.
+				return
+			}
 
 			// SetURL joins the target's base path with the request path and sends the target's host as Host
 			pr.SetURL(route.target)
@@ -130,16 +143,16 @@ func newProxyHandler(skipSSL bool, proxyAddr string, enableH2 bool, disableKeepA
 // rewriteRedirectAndCookies makes the target's redirects and cookies point back at the proxy, so
 // a client whose source host differs from the target host stays on the proxy for the next request.
 func rewriteRedirectAndCookies(resp *http.Response, route proxyRoute) {
-	targetHost := route.target.Hostname()
 	sourceHost := route.source
 	if h, _, err := net.SplitHostPort(sourceHost); err == nil {
 		sourceHost = h
 	}
 
-	// Redirects back to the target host are rewritten to the source host, over plain HTTP, since
-	// that is how clients reach the proxy.
+	// Redirects back to the target (same host AND port) are rewritten to the source authority,
+	// over plain HTTP, since that is how clients reach the proxy. Comparing the full authority
+	// avoids collapsing a redirect to a different port on the same host.
 	if loc := resp.Header.Get("Location"); loc != "" {
-		if u, err := url.Parse(loc); err == nil && strings.EqualFold(u.Hostname(), targetHost) {
+		if u, err := url.Parse(loc); err == nil && strings.EqualFold(u.Host, route.target.Host) {
 			u.Scheme = "http"
 			u.Host = route.source // preserve the authority (and any port) the client used
 			resp.Header.Set("Location", u.String())
@@ -156,8 +169,10 @@ func rewriteRedirectAndCookies(resp *http.Response, route proxyRoute) {
 // (name, value, Path, Secure, HttpOnly, …) untouched. A cookie with no Domain is left as-is.
 func rewriteCookieDomain(setCookie, host string) string {
 	parts := strings.Split(setCookie, ";")
-	for i, p := range parts {
-		if attr := strings.TrimSpace(p); len(attr) > 7 && strings.EqualFold(attr[:7], "domain=") {
+	// parts[0] is the cookie's name=value pair, never an attribute, so start at 1 — otherwise a
+	// cookie literally named "domain" would be clobbered.
+	for i := 1; i < len(parts); i++ {
+		if attr := strings.TrimSpace(parts[i]); len(attr) > 7 && strings.EqualFold(attr[:7], "domain=") {
 			parts[i] = " Domain=" + host
 		}
 	}

@@ -48,6 +48,11 @@ func parseConfig(path string) (map[string]*url.URL, error) {
 
 	m := make(map[string]*url.URL)
 	for _, r := range routes {
+		src := normalizeHost(r.Source)
+		if src == "" {
+			log.Printf("Warning: Skipping route with empty source (target %s)", r.Target)
+			continue
+		}
 		targetURL, err := url.Parse(r.Target)
 		if err != nil {
 			log.Printf("Warning: Skipping invalid target URL %s: %v", r.Target, err)
@@ -57,7 +62,10 @@ func parseConfig(path string) (map[string]*url.URL, error) {
 			log.Printf("Warning: Skipping target %s: must be an absolute URL like https://host", r.Target)
 			continue
 		}
-		m[normalizeHost(r.Source)] = targetURL
+		if _, dup := m[src]; dup {
+			log.Printf("Warning: Duplicate source %s; later target %s overrides the earlier one", r.Source, r.Target)
+		}
+		m[src] = targetURL
 		log.Printf("Loaded Route: %s -> %s", r.Source, r.Target)
 	}
 	return m, nil
@@ -109,6 +117,10 @@ func watchConfig(path string) {
 func normalizeHost(host string) string {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
+	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		// A bracketed IPv6 literal without a port, e.g. "[::1]"; strip the brackets so it matches
+		// the same address seen with a port ("[::1]:80" -> "::1").
+		host = host[1 : len(host)-1]
 	}
 	return strings.TrimSuffix(strings.ToLower(host), ".")
 }

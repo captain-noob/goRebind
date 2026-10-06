@@ -53,6 +53,7 @@ func TestNormalizeHost(t *testing.T) {
 		"api.local.":     "api.local",
 		"api.local.:80":  "api.local",
 		"[::1]:80":       "::1",
+		"[::1]":          "::1", // bracketed IPv6 literal without a port
 	}
 	for in, want := range tests {
 		if got := normalizeHost(in); got != want {
@@ -66,7 +67,8 @@ func TestLoadConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	cfg := `[
 		{"source": "API.Local.", "target": "http://127.0.0.1:9090"},
-		{"source": "bad.local", "target": "api.example.com"}
+		{"source": "bad.local", "target": "api.example.com"},
+		{"source": "", "target": "http://127.0.0.1:7070"}
 	]`
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
@@ -79,6 +81,9 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if _, ok := lookupRoute("bad.local"); ok {
 		t.Error("a target without a scheme should be skipped")
+	}
+	if _, ok := lookupRoute(""); ok {
+		t.Error("an empty source should be skipped")
 	}
 }
 
@@ -218,6 +223,20 @@ func TestProxyRewritesLocationAndCookies(t *testing.T) {
 	}
 }
 
+func TestRewriteCookieDomain(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"sid=abc; Domain=target.com; Path=/", "sid=abc; Domain=src.local; Path=/"},
+		{"sid=abc; Path=/; HttpOnly", "sid=abc; Path=/; HttpOnly"}, // no Domain: untouched
+		{"domain=notanattr; Path=/", "domain=notanattr; Path=/"},   // cookie NAMED domain: untouched
+		{"a=b; domain=target.com", "a=b; Domain=src.local"},        // case-insensitive attribute
+	}
+	for _, tt := range tests {
+		if got := rewriteCookieDomain(tt.in, "src.local"); got != tt.want {
+			t.Errorf("rewriteCookieDomain(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestProxyUnreachableTarget(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -317,6 +336,32 @@ func TestSNIPassthrough(t *testing.T) {
 	resp.Body.Close()
 	if string(body) != "hello-sni" {
 		t.Errorf("body = %q, want %q delivered end-to-end through the tunnel", body, "hello-sni")
+	}
+}
+
+// scriptedListener returns a transient (Temporary) error on the first Accept, then net.ErrClosed.
+type scriptedListener struct{ calls atomic.Int32 }
+
+func (l *scriptedListener) Accept() (net.Conn, error) {
+	if l.calls.Add(1) == 1 {
+		return nil, tempNetErr{}
+	}
+	return nil, net.ErrClosed
+}
+func (l *scriptedListener) Close() error   { return nil }
+func (l *scriptedListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+type tempNetErr struct{}
+
+func (tempNetErr) Error() string   { return "temporary accept error" }
+func (tempNetErr) Timeout() bool   { return false }
+func (tempNetErr) Temporary() bool { return true }
+
+func TestSNIAcceptLoopSurvivesTempError(t *testing.T) {
+	l := &scriptedListener{}
+	serveSNI(l) // returns only after the 2nd Accept yields net.ErrClosed
+	if got := l.calls.Load(); got < 2 {
+		t.Fatalf("serveSNI made %d Accept call(s); a transient error killed the loop (want >= 2)", got)
 	}
 }
 

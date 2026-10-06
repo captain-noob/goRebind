@@ -19,21 +19,39 @@ func startSNIServer(addr string) net.Listener {
 		log.Fatalf("Failed to start HTTPS SNI listener: %v", err)
 	}
 	log.Printf("HTTPS SNI passthrough listening on %s...", addr)
+	go serveSNI(ln)
+	return ln
+}
 
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				if shuttingDown.Load() || errors.Is(err, net.ErrClosed) {
-					return
-				}
-				log.Printf("[ERROR] SNI accept: %v", err)
+// serveSNI accepts connections until the listener closes. It backs off and retries on transient
+// Accept errors (as net/http's own Serve does) rather than dying on the first one.
+func serveSNI(ln net.Listener) {
+	var tempDelay time.Duration
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if shuttingDown.Load() || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			go handleSNIConn(conn)
+			if ne, ok := err.(net.Error); ok && ne.Temporary() { //nolint:staticcheck // Temporary() still signals transient Accept errors
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if tempDelay > time.Second {
+					tempDelay = time.Second
+				}
+				log.Printf("[ERROR] SNI accept (retry in %v): %v", tempDelay, err)
+				time.Sleep(tempDelay)
+				continue
+			}
+			log.Printf("[ERROR] SNI accept: %v", err)
+			return
 		}
-	}()
-	return ln
+		tempDelay = 0
+		go handleSNIConn(conn)
+	}
 }
 
 func handleSNIConn(client net.Conn) {
@@ -72,12 +90,37 @@ func handleSNIConn(client net.Conn) {
 	}
 	defer backend.Close()
 
-	// Tunnel both directions. When either side finishes, the deferred Close on both conns
-	// unblocks the other copy.
+	// Enable TCP keep-alive on both ends so a half-open peer that never closes is eventually
+	// reaped by the OS, instead of pinning the tunnel's goroutines and FDs forever.
+	setKeepAlive(client)
+	setKeepAlive(backend)
+
+	// Tunnel both directions until both close. When one copy ends, half-close the peer's write
+	// side so it sees EOF and finishes its own response, instead of being truncated.
 	done := make(chan struct{}, 2)
-	go func() { io.Copy(backend, clientReader); done <- struct{}{} }()
-	go func() { io.Copy(client, backend); done <- struct{}{} }()
+	go tunnel(backend, clientReader, done)
+	go tunnel(client, backend, done)
 	<-done
+	<-done
+}
+
+// tunnel copies src into dst, then half-closes dst so the peer sees EOF. It falls back to a full
+// close for anything that doesn't support CloseWrite.
+func tunnel(dst net.Conn, src io.Reader, done chan<- struct{}) {
+	_, _ = io.Copy(dst, src)
+	if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	} else {
+		_ = dst.Close()
+	}
+	done <- struct{}{}
+}
+
+func setKeepAlive(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
 }
 
 // sniTargetAddr is the host:port to tunnel a TLS connection to. TLS defaults to port 443 when the

@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -122,7 +124,7 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 // forwardDNS relays a query to upstreamDNS over the same protocol the client used, so the
 // upstream's answer (record types, TTLs, NXDOMAIN, truncation) reaches the client unchanged.
 func forwardDNS(w dns.ResponseWriter, r *dns.Msg) *dns.Msg {
-	c := &dns.Client{Net: "udp"}
+	c := &dns.Client{Net: "udp", Timeout: 5 * time.Second, UDPSize: 4096}
 	if _, ok := w.RemoteAddr().(*net.TCPAddr); ok {
 		c.Net = "tcp"
 	}
@@ -146,8 +148,11 @@ func systemDNSLookup(q dns.Question, m *dns.Msg) {
 	}
 
 	// Look up both families and filter, so a name with only A records gets an empty AAAA answer
-	// rather than NXDOMAIN, which would tell clients the name doesn't exist at all.
-	ips, err := net.LookupIP(strings.TrimSuffix(q.Name, "."))
+	// rather than NXDOMAIN, which would tell clients the name doesn't exist at all. The deadline
+	// keeps a wedged system resolver from pinning the goroutine.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", strings.TrimSuffix(q.Name, "."))
 	if err != nil {
 		var dnsErr *net.DNSError
 		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
